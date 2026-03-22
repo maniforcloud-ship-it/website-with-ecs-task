@@ -50,7 +50,9 @@ jobs:
         run: envsubst < ecs/task-def.json > task-def-final.json
 
       - name: Register task definition
-        run: aws ecs register-task-definition --cli-input-json file://task-def-final.json
+        run: |
+          TASK_DEF_ARN=$(aws ecs register-task-definition --cli-input-json file://task-def-final.json --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "TASK_DEF_ARN=$TASK_DEF_ARN" >> $GITHUB_ENV
 
       - name: Check if service exists
         run: echo "SERVICE_EXISTS=$(aws ecs describe-services --cluster $CLUSTER_NAME --services $SERVICE_NAME --query 'length(services)' --output text)" >> $GITHUB_ENV
@@ -67,9 +69,9 @@ jobs:
       - name: Deploy service
         run: |
           if [ "$SERVICE_EXISTS" = "0" ]; then
-            aws ecs create-service --cluster $CLUSTER_NAME --service-name $SERVICE_NAME --task-definition $TASK_FAMILY --desired-count 1 --launch-type FARGATE --network-configuration "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$SG_ID],assignPublicIp=ENABLED}";
+            aws ecs create-service --cluster $CLUSTER_NAME --service-name $SERVICE_NAME --task-definition $TASK_DEF_ARN --desired-count 1 --launch-type FARGATE --network-configuration "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$SG_ID],assignPublicIp=ENABLED}";
           else
-            aws ecs update-service --cluster $CLUSTER_NAME --service $SERVICE_NAME --task-definition $TASK_FAMILY --force-new-deployment;
+            aws ecs update-service --cluster $CLUSTER_NAME --service $SERVICE_NAME --task-definition $TASK_DEF_ARN --force-new-deployment;
           fi
 
       - name: Wait for stability
