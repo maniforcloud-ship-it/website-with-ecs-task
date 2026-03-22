@@ -1,0 +1,83 @@
+name: CD - Deploy to ECS
+
+on:
+  workflow_run:
+    workflows: ["CI - Build and Push Docker Image"]
+    types:
+      - completed
+
+jobs:
+  deploy:
+    name: Deploy to ECS
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    if: >
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main'
+
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Load env vars
+        run: cat config.env >> $GITHUB_ENV
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get AWS Account ID
+        run: echo "ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)" >> $GITHUB_ENV
+
+      - name: Set variables
+        run: |
+          echo "EXEC_ROLE=arn:aws:iam::$ACCOUNT_ID:role/ecsTaskExecutionRole" >> $GITHUB_ENV
+          echo "IMAGE_URI=$ACCOUNT_ID.dkr.ecr.${AWS_REGION}.amazonaws.com/$REPO_NAME:${{ github.event.workflow_run.head_sha }}" >> $GITHUB_ENV
+
+      - name: Ensure ECS cluster exists
+        run: |
+          STATUS=$(aws ecs describe-clusters --clusters $CLUSTER_NAME --query "clusters[0].status" --output text 2>/dev/null)
+          if [ "$STATUS" != "ACTIVE" ]; then aws ecs create-cluster --cluster-name $CLUSTER_NAME; fi
+
+      - name: Generate task definition
+        run: envsubst < ecs/task-def.json > task-def-final.json
+
+      - name: Register task definition
+        run: aws ecs register-task-definition --cli-input-json file://task-def-final.json
+
+      - name: Check if service exists
+        run: echo "SERVICE_EXISTS=$(aws ecs describe-services --cluster $CLUSTER_NAME --services $SERVICE_NAME --query 'length(services)' --output text)" >> $GITHUB_ENV
+
+      - name: Get networking (first deploy only)
+        if: env.SERVICE_EXISTS == '0'
+        run: |
+          VPC_ID=$(aws ec2 describe-vpcs --filters "Name=isDefault,Values=true" --query "Vpcs[0].VpcId" --output text)
+          SUBNETS=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" --query "Subnets[*].SubnetId" --output text | tr '\t' ',')
+          SG_ID=$(aws ec2 describe-security-groups --filters "Name=vpc-id,Values=$VPC_ID" "Name=group-name,Values=default" --query "SecurityGroups[0].GroupId" --output text)
+          echo "SUBNETS=$SUBNETS" >> $GITHUB_ENV
+          echo "SG_ID=$SG_ID" >> $GITHUB_ENV
+
+      - name: Deploy service
+        run: |
+          if [ "$SERVICE_EXISTS" = "0" ]; then
+            aws ecs create-service --cluster $CLUSTER_NAME --service-name $SERVICE_NAME --task-definition $TASK_FAMILY --desired-count 1 --launch-type FARGATE --network-configuration "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$SG_ID],assignPublicIp=ENABLED}";
+          else
+            aws ecs update-service --cluster $CLUSTER_NAME --service $SERVICE_NAME --task-definition $TASK_FAMILY --force-new-deployment;
+          fi
+
+      - name: Wait for stability
+        run: aws ecs wait services-stable --cluster $CLUSTER_NAME --services $SERVICE_NAME
+
+      - name: Print App URL
+        run: |
+          TASK_ARN=$(aws ecs list-tasks --cluster $CLUSTER_NAME --service-name $SERVICE_NAME --query "taskArns[0]" --output text)
+          ENI_ID=$(aws ecs describe-tasks --cluster $CLUSTER_NAME --tasks $TASK_ARN --query "tasks[0].attachments[0].details[?name=='networkInterfaceId'].value" --output text)
+          PUBLIC_IP=$(aws ec2 describe-network-interfaces --network-interface-ids $ENI_ID --query "NetworkInterfaces[0].Association.PublicIp" --output text)
+          echo "Application URL: http://$PUBLIC_IP"

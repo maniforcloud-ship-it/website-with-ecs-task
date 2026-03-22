@@ -1,0 +1,64 @@
+name: CI - Build and Push Docker Image
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  build-and-push:
+    name: Build, Test & Push
+    runs-on: ubuntu-latest
+
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      IMAGE_TAG: ${{ github.sha }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Load env vars
+        run: cat config.env >> $GITHUB_ENV
+
+      - name: Build Docker image
+        run: docker build -t $REPO_NAME:$IMAGE_TAG .
+
+      - name: Run container for validation
+        run: docker run -d -p 8080:80 --name test-container $REPO_NAME:$IMAGE_TAG
+
+      - name: Test application
+        run: curl -f --retry 5 --retry-delay 2 --retry-all-errors http://localhost:8080
+
+      - name: Cleanup container
+        run: docker rm -f test-container || true
+
+      - name: Configure AWS credentials
+        if: github.event_name == 'push'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get AWS Account ID
+        if: github.event_name == 'push'
+        run: echo "ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)" >> $GITHUB_ENV
+
+      - name: Ensure ECR repository exists
+        if: github.event_name == 'push'
+        run: |
+          if ! aws ecr describe-repositories --repository-names $REPO_NAME >/dev/null; then
+            aws ecr create-repository --repository-name $REPO_NAME
+          fi
+
+      - name: Login to ECR
+        if: github.event_name == 'push'
+        run: aws ecr get-login-password | docker login --username AWS --password-stdin $ACCOUNT_ID.dkr.ecr.${AWS_REGION}.amazonaws.com
+
+      - name: Tag and push image to ECR
+        if: github.event_name == 'push'
+        run: |
+          docker tag $REPO_NAME:$IMAGE_TAG $ACCOUNT_ID.dkr.ecr.${AWS_REGION}.amazonaws.com/$REPO_NAME:$IMAGE_TAG
+          docker push $ACCOUNT_ID.dkr.ecr.${AWS_REGION}.amazonaws.com/$REPO_NAME:$IMAGE_TAG

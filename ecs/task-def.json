@@ -1,0 +1,21 @@
+{
+  "family": "html-task",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "256",
+  "memory": "512",
+  "executionRoleArn": "${EXEC_ROLE}",
+  "containerDefinitions": [
+    {
+      "name": "html-container",
+      "image": "${IMAGE_URI}",
+      "portMappings": [
+        {
+          "containerPort": 80,
+          "protocol": "tcp"
+        }
+      ],
+      "essential": true
+    }
+  ]
+}
